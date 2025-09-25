@@ -1,0 +1,111 @@
+name: Fetch Cookies
+
+on:
+  schedule:
+    - cron: '0 * * * *' # runs every hour
+  workflow_dispatch:
+
+jobs:
+  fetch-and-push-cookies:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Setup Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      # 3️⃣ Run JS script to fetch cookies
+      - name: Fetch JS & ZF cookies
+        env:
+          JS: ${{ secrets.JS }}
+          ZF: ${{ secrets.ZF }}
+        run: |
+          node scripts/cookie-extractor.js
+
+      # 4️⃣ Commit updated cookies locally
+      - name: Commit updated cookies
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🔒 Automatically updated cookies"
+          commit_user_name: "GitHub Actions"
+          commit_user_email: "actions@github.com"
+
+      # 5️⃣ Push selected cookie files to repo
+      - name: Push cookies to repo
+        env:
+          REPO_PAT: ${{ secrets.REPO_PAT }}
+        run: |
+          # Disable command printing to protect secrets
+          set +x
+
+          TARGET_REPO="https://x-access-token:${REPO_PAT}@github.com/senvora/ravelynth.git"
+          TARGET_BRANCH="main"
+          FILES=("cookie/js-hdnea-cookie.txt" "cookie/zf-hdntl-cookie.txt")
+          DEST_FOLDER="playlist/cookie"
+
+          # Clone the repo
+          git clone --depth 1 --branch "$TARGET_BRANCH" "$TARGET_REPO" tmp_repo
+          cd tmp_repo
+          mkdir -p "$DEST_FOLDER"
+
+          # Check if any file changed
+          CHANGED=false
+          for FILE in "${FILES[@]}"; do
+            if [ ! -f "../$FILE" ]; then
+              echo "⚠️ File not found, skipping: $FILE"
+              continue
+            fi
+
+            SRC_HASH=$(sha256sum "../$FILE" | awk '{print $1}')
+            DEST_FILE="$DEST_FOLDER/$(basename $FILE)"
+            if [ -f "$DEST_FILE" ]; then
+              DEST_HASH=$(sha256sum "$DEST_FILE" | awk '{print $1}')
+            else
+              DEST_HASH="none"
+            fi
+
+            if [ "$SRC_HASH" != "$DEST_HASH" ]; then
+              CHANGED=true
+              echo "File changed: $FILE"
+            fi
+          done
+
+          if [ "$CHANGED" = false ]; then
+            echo "⚡ No cookie files changed, skipping commit."
+            exit 0
+          fi
+
+          # Copy changed files
+          for FILE in "${FILES[@]}"; do
+            if [ -f "../$FILE" ]; then
+              cp "../$FILE" "$DEST_FOLDER/"
+            fi
+          done
+
+          # Configure git
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+          git add "$DEST_FOLDER"
+          git commit -m "🔄 Automatically updated cookies"
+
+          # Retry push up to 3 times
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            git pull --rebase --autostash origin "$TARGET_BRANCH" || true
+            if git push "$TARGET_REPO" "$TARGET_BRANCH"; then
+              echo "✅ Push succeeded"
+              break
+            else
+              echo "⚠️ Push failed, retrying ($i/$MAX_RETRIES)..."
+              sleep 5
+            fi
+          done
+
+          # Re-enable command printing
+          set -x
