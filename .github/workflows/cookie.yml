@@ -1,0 +1,126 @@
+name: Fetch Cookies
+
+on:
+  schedule:
+    - cron: '0 * * * *' # runs every hour
+  workflow_dispatch:
+
+jobs:
+  fetch-and-push-cookies:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Cache last upstream commit
+      - name: Restore last upstream commit from cache
+        id: cache
+        uses: actions/cache@v3
+        with:
+          path: .last_upstream_commit
+          key: upstream-commit-cache
+
+      # 3️⃣ Check for new commits in upstream public repo
+      - name: Check upstream commits
+        id: check_upstream
+        run: |
+          REPO="${{ secrets.UPSTREAM_REPO }}"
+          LATEST_COMMIT=$(git ls-remote "$REPO" HEAD | awk '{print $1}')
+          echo "Latest commit on upstream: $LATEST_COMMIT"
+
+          LAST_COMMIT=""
+          if [ -f ".last_upstream_commit" ]; then
+            LAST_COMMIT=$(cat .last_upstream_commit)
+          fi
+
+          if [ "$LATEST_COMMIT" = "$LAST_COMMIT" ]; then
+            echo "No new commits in upstream repo. Exiting."
+            echo "continue=false" >> $GITHUB_OUTPUT
+          else
+            echo "$LATEST_COMMIT" > .last_upstream_commit
+            echo "New commit detected!"
+            echo "continue=true" >> $GITHUB_OUTPUT
+          fi
+
+      # 4️⃣ Stop if no new commits
+      - name: Stop if no new commits
+        if: steps.check_upstream.outputs.continue == 'false'
+        run: exit 0
+
+      # 5️⃣ Setup Node.js (runs only if upstream changed)
+      - name: Set up Node.js
+        if: steps.check_upstream.outputs.continue == 'true'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      # 6️⃣ Fetch cookies and push only if successful
+      - name: Fetch & push cookies atomically
+        if: steps.check_upstream.outputs.continue == 'true'
+        id: fetch_cookies
+        env:
+          JS: ${{ secrets.JS }}
+          ZF: ${{ secrets.ZF }}
+        run: |
+          set -e
+          set +x
+
+          # Run JS cookie extractor
+          node scripts/cookie-extractor.js
+
+          # Target repo & branch from secrets
+          TARGET_REPO="${{ secrets.TARGET_REPO_AUTH_URL }}"
+          TARGET_BRANCH="${{ secrets.TARGET_BRANCH }}"
+          FILES=("cookie/js-hdnea-cookie.txt" "cookie/zf-hdntl-cookie.txt")
+          DEST_FOLDER="playlist/cookie"
+
+          # Shallow clone target repo
+          git clone --depth 1 --branch "$TARGET_BRANCH" "$TARGET_REPO" tmp_repo
+          cd tmp_repo
+          mkdir -p "$DEST_FOLDER"
+
+          # Copy files
+          for FILE in "${FILES[@]}"; do
+            if [ ! -f "../$FILE" ]; then
+              echo "⚠️ File not found, skipping: $FILE"
+              continue
+            fi
+            cp "../$FILE" "$DEST_FOLDER/"
+          done
+
+          # Stage files before checking for changes
+          git add "$DEST_FOLDER"
+
+          # Detect changes using staged diff
+          CHANGED=false
+          if git diff --cached --quiet; then
+            echo "⚡ No cookie files changed, skipping commit and push."
+            exit 0
+          else
+            CHANGED=true
+          fi
+
+          # Commit changes
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+          git commit -m "🔄 Automatically updated cookies"
+
+          # Push with exponential backoff
+          MAX_RETRIES=5
+          SLEEP_TIME=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            git pull --rebase --autostash origin "$TARGET_BRANCH" || true
+            if git push "$TARGET_REPO" "$TARGET_BRANCH"; then
+              echo "✅ Push succeeded"
+              break
+            else
+              echo "⚠️ Push failed, retrying ($i/$MAX_RETRIES)..."
+              sleep $SLEEP_TIME
+              SLEEP_TIME=$((SLEEP_TIME * 2))
+            fi
+          done
+
+          set -x
+          echo "cookies_updated=$CHANGED" >> $GITHUB_OUTPUT
